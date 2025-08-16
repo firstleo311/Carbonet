@@ -8,11 +8,19 @@
 (define-constant err-already-retired (err u106))
 (define-constant err-invalid-reason (err u107))
 (define-constant err-invalid-certification-level (err u108))
+(define-constant err-insufficient-premium (err u109))
+(define-constant err-policy-not-found (err u110))
+(define-constant err-claim-already-processed (err u111))
+(define-constant err-invalid-risk-level (err u112))
+(define-constant err-policy-expired (err u113))
 
 (define-data-var total-credits uint u0)
 (define-data-var price-per-credit uint u1000000)
 (define-data-var total-retired-credits uint u0)
 (define-data-var retirement-certificate-counter uint u0)
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var total-policies-issued uint u0)
+(define-data-var base-premium-rate uint u50000)
 
 (define-map projects 
     { project-id: uint }
@@ -75,6 +83,58 @@
         retirement-count: uint,
         last-retirement-date: uint,
         highest-certification-level: uint
+    }
+)
+
+;; Insurance system data maps
+(define-map insurance-policies
+    { policy-id: uint }
+    {
+        policy-holder: principal,
+        project-id: uint,
+        insured-amount: uint,
+        premium-paid: uint,
+        coverage-start: uint,
+        coverage-end: uint,
+        risk-level: uint,
+        policy-status: uint,
+        coverage-percentage: uint
+    }
+)
+
+(define-map insurance-claims
+    { claim-id: uint }
+    {
+        policy-id: uint,
+        claimant: principal,
+        claim-amount: uint,
+        claim-reason: (string-ascii 150),
+        claim-date: uint,
+        claim-status: uint,
+        assessor: (optional principal),
+        payout-amount: uint
+    }
+)
+
+(define-map project-risk-profiles
+    { project-id: uint }
+    {
+        risk-score: uint,
+        historical-failures: uint,
+        assessment-date: uint,
+        risk-factors: (list 5 (string-ascii 30)),
+        mitigation-measures: (string-ascii 200)
+    }
+)
+
+(define-map user-insurance-stats
+    { user: principal }
+    {
+        total-policies: uint,
+        total-premiums-paid: uint,
+        total-claims-filed: uint,
+        total-payouts-received: uint,
+        risk-rating: uint
     }
 )
 
@@ -408,4 +468,219 @@
             platform-environmental-impact: (* total-retired u100)
         }
     )
+)
+
+;; Insurance system functions
+(define-public (purchase-insurance-policy (project-id uint) (insured-amount uint) (coverage-duration uint) (coverage-percentage uint))
+    (let
+        (
+            (project (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+            (risk-profile (default-to { risk-score: u3, historical-failures: u0, assessment-date: u0, risk-factors: (list), mitigation-measures: "" } (map-get? project-risk-profiles { project-id: project-id })))
+            (calculated-premium (calculate-insurance-premium insured-amount (get risk-score risk-profile) coverage-duration coverage-percentage))
+            (policy-id (var-get total-policies-issued))
+            (user-stats (default-to { total-policies: u0, total-premiums-paid: u0, total-claims-filed: u0, total-payouts-received: u0, risk-rating: u3 } (map-get? user-insurance-stats { user: tx-sender })))
+        )
+        (asserts! (> insured-amount u0) err-invalid-amount)
+        (asserts! (and (>= coverage-percentage u10) (<= coverage-percentage u100)) err-invalid-certification-level)
+        (asserts! (> coverage-duration u144) err-invalid-amount) ;; minimum 1 day coverage
+        (asserts! (get verification-status project) err-unauthorized)
+        
+        (try! (stx-transfer? calculated-premium tx-sender (as-contract tx-sender)))
+        
+        (map-set insurance-policies
+            { policy-id: policy-id }
+            {
+                policy-holder: tx-sender,
+                project-id: project-id,
+                insured-amount: insured-amount,
+                premium-paid: calculated-premium,
+                coverage-start: stacks-block-height,
+                coverage-end: (+ stacks-block-height coverage-duration),
+                risk-level: (get risk-score risk-profile),
+                policy-status: u1, ;; active
+                coverage-percentage: coverage-percentage
+            }
+        )
+        
+        (map-set user-insurance-stats
+            { user: tx-sender }
+            {
+                total-policies: (+ (get total-policies user-stats) u1),
+                total-premiums-paid: (+ (get total-premiums-paid user-stats) calculated-premium),
+                total-claims-filed: (get total-claims-filed user-stats),
+                total-payouts-received: (get total-payouts-received user-stats),
+                risk-rating: (get risk-rating user-stats)
+            }
+        )
+        
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) calculated-premium))
+        (var-set total-policies-issued (+ policy-id u1))
+        (ok policy-id)
+    )
+)
+
+(define-public (file-insurance-claim (policy-id uint) (claim-amount uint) (claim-reason (string-ascii 150)))
+    (let
+        (
+            (policy (unwrap! (map-get? insurance-policies { policy-id: policy-id }) err-policy-not-found))
+            (claim-id (var-get total-policies-issued)) ;; reuse counter for simplicity
+            (user-stats (default-to { total-policies: u0, total-premiums-paid: u0, total-claims-filed: u0, total-payouts-received: u0, risk-rating: u3 } (map-get? user-insurance-stats { user: tx-sender })))
+        )
+        (asserts! (is-eq (get policy-holder policy) tx-sender) err-unauthorized)
+        (asserts! (is-eq (get policy-status policy) u1) err-policy-expired) ;; policy must be active
+        (asserts! (<= stacks-block-height (get coverage-end policy)) err-policy-expired)
+        (asserts! (>= stacks-block-height (get coverage-start policy)) err-policy-expired)
+        (asserts! (> claim-amount u0) err-invalid-amount)
+        (asserts! (<= claim-amount (get insured-amount policy)) err-invalid-amount)
+        (asserts! (>= (len claim-reason) u20) err-invalid-reason)
+        
+        (map-set insurance-claims
+            { claim-id: claim-id }
+            {
+                policy-id: policy-id,
+                claimant: tx-sender,
+                claim-amount: claim-amount,
+                claim-reason: claim-reason,
+                claim-date: stacks-block-height,
+                claim-status: u1, ;; pending review
+                assessor: none,
+                payout-amount: u0
+            }
+        )
+        
+        (map-set user-insurance-stats
+            { user: tx-sender }
+            (merge user-stats { total-claims-filed: (+ (get total-claims-filed user-stats) u1) })
+        )
+        
+        (ok claim-id)
+    )
+)
+
+(define-public (process-insurance-claim (claim-id uint) (approved bool) (payout-amount uint))
+    (let
+        (
+            (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) err-not-found))
+            (policy (unwrap! (map-get? insurance-policies { policy-id: (get policy-id claim) }) err-policy-not-found))
+            (verifier-status (unwrap! (map-get? project-verifiers { verifier: tx-sender }) err-unauthorized))
+            (user-stats (default-to { total-policies: u0, total-premiums-paid: u0, total-claims-filed: u0, total-payouts-received: u0, risk-rating: u3 } (map-get? user-insurance-stats { user: (get claimant claim) })))
+        )
+        (asserts! (get active verifier-status) err-unauthorized)
+        (asserts! (is-eq (get claim-status claim) u1) err-claim-already-processed) ;; must be pending
+        (asserts! (if approved (<= payout-amount (get claim-amount claim)) true) err-invalid-amount)
+        (asserts! (if approved (>= (var-get insurance-pool-balance) payout-amount) true) err-insufficient-balance)
+        
+        (if approved
+            (begin
+                (try! (as-contract (stx-transfer? payout-amount tx-sender (get claimant claim))))
+                (var-set insurance-pool-balance (- (var-get insurance-pool-balance) payout-amount))
+                (map-set user-insurance-stats
+                    { user: (get claimant claim) }
+                    (merge user-stats { total-payouts-received: (+ (get total-payouts-received user-stats) payout-amount) })
+                )
+            )
+            true
+        )
+        
+        (map-set insurance-claims
+            { claim-id: claim-id }
+            (merge claim {
+                claim-status: (if approved u2 u3), ;; 2=approved, 3=rejected
+                assessor: (some tx-sender),
+                payout-amount: payout-amount
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (update-project-risk-profile (project-id uint) (risk-score uint) (risk-factors (list 5 (string-ascii 30))) (mitigation-measures (string-ascii 200)))
+    (let
+        (
+            (project (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+            (verifier-status (unwrap! (map-get? project-verifiers { verifier: tx-sender }) err-unauthorized))
+            (current-profile (default-to { risk-score: u3, historical-failures: u0, assessment-date: u0, risk-factors: (list), mitigation-measures: "" } (map-get? project-risk-profiles { project-id: project-id })))
+        )
+        (asserts! (get active verifier-status) err-unauthorized)
+        (asserts! (and (<= risk-score u5) (>= risk-score u1)) err-invalid-risk-level)
+        
+        (map-set project-risk-profiles
+            { project-id: project-id }
+            {
+                risk-score: risk-score,
+                historical-failures: (get historical-failures current-profile),
+                assessment-date: stacks-block-height,
+                risk-factors: risk-factors,
+                mitigation-measures: mitigation-measures
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (record-project-failure (project-id uint))
+    (let
+        (
+            (project (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+            (verifier-status (unwrap! (map-get? project-verifiers { verifier: tx-sender }) err-unauthorized))
+            (current-profile (default-to { risk-score: u3, historical-failures: u0, assessment-date: u0, risk-factors: (list), mitigation-measures: "" } (map-get? project-risk-profiles { project-id: project-id })))
+        )
+        (asserts! (get active verifier-status) err-unauthorized)
+        
+        (map-set project-risk-profiles
+            { project-id: project-id }
+            (merge current-profile {
+                historical-failures: (+ (get historical-failures current-profile) u1),
+                risk-score: (if (< (get risk-score current-profile) u5) (+ (get risk-score current-profile) u1) u5)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (calculate-insurance-premium (insured-amount uint) (risk-score uint) (coverage-duration uint) (coverage-percentage uint))
+    (let
+        (
+            (base-rate (var-get base-premium-rate))
+            (risk-multiplier (+ u100 (* risk-score u25))) ;; 125%, 150%, 175%, 200%, 225% for risk levels 1-5
+            (duration-factor (+ u100 (/ coverage-duration u1440))) ;; additional cost per day
+            (coverage-factor (+ u100 coverage-percentage)) ;; percentage-based factor
+        )
+        (/ (* (* (* insured-amount base-rate) risk-multiplier) duration-factor) (* u100000000 coverage-factor))
+    )
+)
+
+;; Read-only functions for insurance system
+(define-read-only (get-insurance-policy (policy-id uint))
+    (map-get? insurance-policies { policy-id: policy-id })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+    (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-project-risk-profile (project-id uint))
+    (map-get? project-risk-profiles { project-id: project-id })
+)
+
+(define-read-only (get-user-insurance-stats (user principal))
+    (default-to { total-policies: u0, total-premiums-paid: u0, total-claims-filed: u0, total-payouts-received: u0, risk-rating: u3 } (map-get? user-insurance-stats { user: user }))
+)
+
+(define-read-only (calculate-premium-quote (insured-amount uint) (project-id uint) (coverage-duration uint) (coverage-percentage uint))
+    (let
+        (
+            (risk-profile (default-to { risk-score: u3, historical-failures: u0, assessment-date: u0, risk-factors: (list), mitigation-measures: "" } (map-get? project-risk-profiles { project-id: project-id })))
+        )
+        (calculate-insurance-premium insured-amount (get risk-score risk-profile) coverage-duration coverage-percentage)
+    )
+)
+
+(define-read-only (get-insurance-pool-status)
+    {
+        pool-balance: (var-get insurance-pool-balance),
+        total-policies: (var-get total-policies-issued),
+        base-premium-rate: (var-get base-premium-rate)
+    }
 )
